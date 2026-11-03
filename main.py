@@ -24,6 +24,8 @@ def print_similarity_matrix(engine: RecommendationEngine, limit: int = 5) -> Non
 
 
 def main() -> None:
+    # This command-line entry point runs the full workflow from reading the CSV to
+    # exporting the final recommendations for the user.
     parser = argparse.ArgumentParser(
         description="Generate explainable grocery recommendations from purchase history."
     )

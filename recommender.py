@@ -8,12 +8,16 @@ DATA_PATH = Path("data") / "purchases.csv"
 OUTPUT_PATH = PROJECT_DIR / "output" / "recommendations.csv"
 
 
+# Read the purchase records.
+# This function opens the CSV file, validates the required columns, and separates
+# valid rows from rejected rows with a clear reason for each invalid record.
 def read_purchases(
     path: str | Path = DATA_PATH,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Load normalized purchase rows and rows rejected with a reason."""
     valid_rows: list[dict[str, Any]] = []
     rejected_rows: list[dict[str, Any]] = []
+    seen_purchase_ids: set[str] = set()
 
     with Path(path).open(newline="", encoding="utf-8-sig") as csvfile:
         reader = csv.DictReader(csvfile)
@@ -24,7 +28,14 @@ def read_purchases(
         if len(headers) != len(set(headers)):
             raise ValueError("Purchase CSV contains duplicate column names.")
         reader.fieldnames = headers
-        required_headers = {"customer_id", "product_id", "product_name"}
+
+        required_headers = {
+            "purchase_id",
+            "customer_id",
+            "product_id",
+            "product_name",
+            "quantity",
+        }
         missing_headers = required_headers - set(headers)
         if missing_headers:
             names = ", ".join(sorted(missing_headers))
@@ -35,11 +46,21 @@ def read_purchases(
             if None in row:
                 rejection_reason = "row contains more values than the header"
 
+            purchase_id = (row.get("purchase_id") or "").strip()
             customer_id = (row.get("customer_id") or "").strip().casefold()
             product_id = (row.get("product_id") or "").strip().casefold()
             product_name = (row.get("product_name") or "").strip()
             category = (row.get("category") or "").strip()
-            quantity_value = row.get("quantity")
+            quantity_value = (row.get("quantity") or "").strip()
+
+            if not rejection_reason and not purchase_id:
+                rejection_reason = "purchase_id is blank"
+            elif not rejection_reason:
+                normalized_purchase_id = purchase_id.casefold()
+                if normalized_purchase_id in seen_purchase_ids:
+                    rejection_reason = "purchase_id is a duplicate"
+                else:
+                    seen_purchase_ids.add(normalized_purchase_id)
 
             if not rejection_reason and not customer_id:
                 rejection_reason = "customer_id is blank"
@@ -48,19 +69,19 @@ def read_purchases(
             elif not rejection_reason and not product_name:
                 rejection_reason = "product_name is blank"
 
-            if not rejection_reason and "quantity" in headers:
-                if quantity_value is None or not quantity_value.strip():
+            if not rejection_reason:
+                if not quantity_value:
                     rejection_reason = "quantity is blank"
                 else:
                     try:
-                        quantity = int(quantity_value.strip())
+                        quantity = int(quantity_value)
                     except ValueError:
                         rejection_reason = "quantity must be a positive whole number"
                     else:
                         if quantity <= 0:
                             rejection_reason = "quantity must be a positive whole number"
             else:
-                quantity = 1
+                quantity = quantity_value
 
             normalized_row = {
                 key: value
@@ -71,6 +92,7 @@ def read_purchases(
                 normalized_row["_extra_values"] = row[None]
             normalized_row.update(
                 {
+                    "purchase_id": purchase_id,
                     "customer_id": customer_id,
                     "product_id": product_id,
                     "product_name": product_name,
@@ -88,6 +110,10 @@ def read_purchases(
     return valid_rows, rejected_rows
 
 
+# Calculate Jaccard similarity.
+# This function measures the overlap between two customer product sets using the
+# standard formula: intersection divided by union. If both sets are empty, the
+# similarity is treated as 1.0 so two empty histories are considered identical.
 def jaccard(a: set[str], b: set[str]) -> float:
     """Return Jaccard similarity, treating two empty histories as identical."""
     union = a | b
@@ -96,6 +122,10 @@ def jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(union)
 
 
+#  Store purchase histories in dictionaries and sets.
+#  Build the RecommendationEngine class.
+# This class keeps each customer's product history, product metadata, and product
+# popularity in efficient structures so recommendations can be computed quickly.
 class RecommendationEngine:
     """Recommend products from similar customers' distinct purchase histories."""
 
@@ -183,6 +213,9 @@ class RecommendationEngine:
         k: int = 3,
     ) -> list[tuple[str, float]]:
         """Return up to k other customers, highest similarity first."""
+        # Identify similar customers.
+        # We compare the current customer against all other customers, keep only those
+        # meeting the minimum similarity threshold, and sort the valid matches by score.
         self._validate_count(k, "k")
         normalized_id = self._require_customer(customer_id)
         neighbours = [
@@ -198,55 +231,49 @@ class RecommendationEngine:
         eligible.sort(key=lambda item: (-item[1], item[0]))
         return eligible[:k]
 
+    # Generate product recommendations.
+    # This method gathers unseen products that were bought by similar customers and
+    # records the evidence behind each recommendation before ranking it.
     def candidate_products(
         self,
         customer_id: str,
         k: int = 3,
     ) -> dict[str, dict[str, Any]]:
-        """Collect unseen products and the neighbours (if any) supporting them."""
+        """Collect unseen products supported by similar neighbours."""
         self._validate_count(k, "k")
         normalized_id = self._require_customer(customer_id)
         history = self.customer_products[normalized_id]
         neighbours = self.similar_customers(normalized_id, k)
-        evidence: dict[str, dict[str, Any]] = {}
+        if not neighbours:
+            return {}
 
-        if neighbours:
-            for neighbour_id, similarity in neighbours:
-                for product_id in self.customer_products[neighbour_id] - history:
-                    product_evidence = evidence.setdefault(
-                        product_id,
-                        {
-                            "product_id": product_id,
-                            "product_name": (
-                                self.product_info[product_id]["name"] or product_id
-                            ),
-                            "category": self.product_info[product_id]["category"],
-                            "supporting_customers": [],
-                            "support_count": 0,
-                            "neighbor_count": len(neighbours),
-                            "popularity": self.product_popularity[product_id],
-                        },
-                    )
-                    product_evidence["supporting_customers"].append(
-                        {"customer_id": neighbour_id, "similarity": similarity}
-                    )
-                    product_evidence["support_count"] += 1
-        else:
-            for product_id in self.product_info:
-                if product_id in history:
-                    continue
-                evidence[product_id] = {
-                    "product_id": product_id,
-                    "product_name": self.product_info[product_id]["name"] or product_id,
-                    "category": self.product_info[product_id]["category"],
-                    "supporting_customers": [],
-                    "support_count": 0,
-                    "neighbor_count": 0,
-                    "popularity": self.product_popularity[product_id],
-                }
+        evidence: dict[str, dict[str, Any]] = {}
+        for neighbour_id, similarity in neighbours:
+            for product_id in self.customer_products[neighbour_id] - history:
+                product_evidence = evidence.setdefault(
+                    product_id,
+                    {
+                        "product_id": product_id,
+                        "product_name": (
+                            self.product_info[product_id]["name"] or product_id
+                        ),
+                        "category": self.product_info[product_id]["category"],
+                        "supporting_customers": [],
+                        "support_count": 0,
+                        "neighbor_count": len(neighbours),
+                        "popularity": self.product_popularity[product_id],
+                    },
+                )
+                product_evidence["supporting_customers"].append(
+                    {"customer_id": neighbour_id, "similarity": similarity}
+                )
+                product_evidence["support_count"] += 1
 
         return {product_id: evidence[product_id] for product_id in sorted(evidence)}
 
+    # Rank recommendations with custom logic.
+    # The score combines similarity, support from similar customers, and popularity so
+    # products with stronger evidence are listed first.
     def score(self, evidence: dict[str, Any]) -> float:
         """Combine mean neighbour similarity, neighbour support, and popularity."""
         supporters = evidence["supporting_customers"]
@@ -329,6 +356,9 @@ class RecommendationEngine:
             "supporting_customers": "",
         }
 
+    # Export recommendations to CSV.
+    # This method ensures every customer appears in the final output, even when there
+    # are no valid recommendations for that customer, and writes the ranked rows to disk.
     def export_csv(
         self,
         rows: list[dict[str, Any]],
